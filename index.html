@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>vi-forge · 手写变分推断（CAVI 均值场）</title>
+<style>
+:root{
+  --bg:#f5f6fb; --card:#ffffff; --ink:#161a2b; --muted:#6b7280;
+  --line:#e6e8f0; --c1:#5b5bd6; --c2:#0ea472; --c3:#e08a1e; --c4:#dc3b3b;
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
+header h1{margin:0 0 6px;font-size:23px;letter-spacing:-.3px}
+header p{margin:0;color:var(--muted);font-size:13.5px}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;background:#eceafe;color:#4b45c6;
+  font-size:11.5px;font-weight:600;margin-left:8px;vertical-align:2px}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:18px 0 14px}
+label.f{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+input[type=number]{width:72px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;
+  background:#fff;color:var(--ink);font:inherit;font-size:13px}
+select{padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#fff;
+  color:var(--ink);font:inherit;font-size:13px}
+button{padding:8px 18px;border:0;border-radius:9px;background:var(--c1);color:#fff;font:inherit;
+  font-size:13.5px;font-weight:600;cursor:pointer;transition:.15s}
+button:hover{filter:brightness(1.07)}
+button:disabled{opacity:.55;cursor:default}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+  box-shadow:0 1px 2px rgba(16,20,45,.04)}
+.card h2{margin:0 0 12px;font-size:12px;font-weight:700;letter-spacing:.5px;color:var(--muted);
+  text-transform:uppercase}
+canvas{display:block;width:100%;height:auto;border-radius:8px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+@media(max-width:620px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 13px}
+.stat .k{font-size:11px;color:var(--muted);letter-spacing:.3px}
+.stat .v{font-family:var(--mono);font-size:16px;font-weight:700;margin-top:3px}
+ul.checks{list-style:none;margin:0;padding:0}
+ul.checks li{display:flex;gap:8px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:13px}
+ul.checks li:last-child{border-bottom:0}
+ul.checks .mk{width:16px;flex:none;font-weight:700}
+.ok{color:var(--c2)} .no{color:var(--c4)}
+.note{color:var(--muted);font-size:12.5px;margin-top:12px;line-height:1.65}
+code{font-family:var(--mono);background:#f0f1f7;padding:1px 5px;border-radius:5px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>vi-forge <span class="badge">CAVI · 均值场</span></h1>
+  <p>手写变分推断：贝叶斯高斯混合 + 坐标上升变分推断。ELBO 闭合形式（含 digamma / lgamma），零依赖单文件。</p>
+</header>
+
+<div class="bar">
+  <label class="f">seed <input type="number" id="seed" value="42" min="0" step="1"></label>
+  <label class="f">K <input type="number" id="K" value="3" min="1" max="6" step="1"></label>
+  <label class="f">N <input type="number" id="N" value="210" min="30" max="1200" step="10"></label>
+  <label class="f">重启动 <input type="number" id="restarts" value="6" min="1" max="20" step="1"></label>
+  <label class="f">数据 <select id="mode">
+    <option value="sep">分离（硬责任度）</option>
+    <option value="ovl">重叠（软责任度）</option>
+  </select></label>
+  <button id="run">运行推断</button>
+  <span id="status" class="note" style="margin:0"></span>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="grid">
+  <div class="card"><h2>ELBO 收敛曲线（单调不减）</h2><canvas id="cElbo" width="640" height="240"></canvas></div>
+  <div class="card"><h2>后验聚类（均值 ± 标准差）</h2><canvas id="cScatter" width="640" height="420"></canvas></div>
+  <div class="card"><h2>责任度热图 r<sub>nk</sub>（K 行 × N 列）</h2><canvas id="cHeat" width="640" height="190"></canvas></div>
+  <div class="card"><h2>不变量自检</h2><ul class="checks" id="checks"></ul></div>
+</div>
+
+<p class="note">模型：π ~ Dirichlet(α₀)，μ<sub>k</sub> ~ N(μ₀, σ₀²I)，x<sub>n</sub>|z<sub>n</sub> ~ N(μ<sub>zₙ</sub>, σ²I)（σ² 固定）。
+均值场 <code>q(π)q(Z)∏q(μ_k)</code>，ELBO 闭合形式。CAVI 定理保证 ELBO 每步不减，且 ≤ log p(X)（变分下界）。</p>
+</div>
+
+<script id="engine">
+(function(){
+'use strict';
+var VI = {};
+VI.version = '1.0.0';
+
+/* ============================ RNG ============================ */
+VI.mulberry32 = function(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+};
+VI.randn = function(rng){
+  var u = 0, v = 0;
+  while(u === 0) u = rng();
+  while(v === 0) v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+};
+
+/* ===================== special functions ===================== */
+var LANCZOS = [
+  676.5203681218851, -1259.1392167224028, 771.32342877765313,
+  -176.61502916214059, 12.507343278686905, -0.13857109526572012,
+  9.9843695780195716e-6, 1.5056327351493116e-7
+];
+// log Gamma(x), Lanczos g=7, n=9 + reflection
+VI.lgamma = function(x){
+  if(x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - VI.lgamma(1 - x);
+  x -= 1;
+  var a = 0.99999999999980993, t = x + 7.5, i;
+  for(i = 0; i < 8; i++) a += LANCZOS[i] / (x + i + 1);
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+};
+// psi(x) = d/dx log Gamma(x): recurrence to x>=10 then asymptotic series
+// psi(x) ~ ln x - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + 1/(240x^8) - 1/(132x^10) + 691/(32760x^12)
+VI.digamma = function(x){
+  var r = 0;
+  while(x < 10){ r -= 1 / x; x += 1; }
+  var inv = 1 / x, i2 = inv * inv, i4 = i2 * i2, i6 = i4 * i2, i8 = i4 * i4;
+  return r + Math.log(x) - 0.5 * inv
+       - (1 / 12) * i2 + (1 / 120) * i4 - (1 / 252) * i6
+       + (1 / 240) * i8 - (1 / 132) * i8 * i2 + (691 / 32760) * i6 * i6;
+};
+
+/* ============================ data ============================ */
+VI.makeData = function(rng, means, per, sigma){
+  var K = means.length, D = means[0].length, X = [], labels = [], i, j, k, v;
+  for(k = 0; k < K; k++){
+    for(i = 0; i < per; i++){
+      v = new Array(D);
+      for(j = 0; j < D; j++) v[j] = means[k][j] + sigma * VI.randn(rng);
+      X.push(v); labels.push(k);
+    }
+  }
+  return { X: X, labels: labels, K: K, D: D, N: X.length };
+};
+
+/* ===================== init (K-Means++) ===================== */
+VI.kmeanspp = function(X, K, rng){
+  var N = X.length, D = X[0].length, c, d2, k, n, d, q, s, t, idx, last;
+
+  function d2p(a, b){ var r = 0, j; for(j = 0; j < D; j++){ var df = a[j] - b[j]; r += df * df; } return r; }
+
+  c = [X[Math.floor(rng() * N) % N].slice()];
+  d2 = new Array(N);
+  for(n = 0; n < N; n++) d2[n] = Infinity;
+  while(c.length < K){
+    last = c[c.length - 1];
+    for(n = 0; n < N; n++){ q = d2p(X[n], last); if(q < d2[n]) d2[n] = q; }
+    s = 0; for(n = 0; n < N; n++) s += d2[n];
+    if(!(s > 0)){ c.push(X[Math.floor(rng() * N) % N].slice()); continue; }
+    t = rng() * s; idx = N - 1;
+    for(n = 0; n < N; n++){ t -= d2[n]; if(t <= 0){ idx = n; break; } }
+    c.push(X[idx].slice());
+  }
+  return c;
+};
+
+// soft E-step init from K-Means++ centres
+VI.init = function(X, K, seed, sigmaSq){
+  var N = X.length, D = X[0].length, rng = VI.mulberry32(seed);
+  var C = VI.kmeanspp(X, K, rng), r = [], n, k, d, row, mx, s, q;
+  for(n = 0; n < N; n++){
+    row = new Array(K); mx = -Infinity;
+    for(k = 0; k < K; k++){
+      q = 0;
+      for(d = 0; d < D; d++){ var df = X[n][d] - C[k][d]; q += df * df; }
+      row[k] = -0.5 * q / sigmaSq;
+      if(row[k] > mx) mx = row[k];
+    }
+    s = 0;
+    for(k = 0; k < K; k++){ row[k] = Math.exp(row[k] - mx); s += row[k]; }
+    for(k = 0; k < K; k++) row[k] /= s;
+    r.push(row);
+  }
+  return { r: r };
+};
+
+/* ===================== responsibilities ===================== */
+VI.hardAssign = function(r){
+  var N = r.length, out = new Array(N), n, k, best, bv;
+  for(n = 0; n < N; n++){
+    best = 0; bv = -Infinity;
+    for(k = 0; k < r[n].length; k++) if(r[n][k] > bv){ bv = r[n][k]; best = k; }
+    out[n] = best;
+  }
+  return out;
+};
+
+// permutation-invariant cluster accuracy (greedy majority matching)
+VI.clusterAcc = function(labels, hard, K){
+  var cnt = [], k, i, l, pairs, usedK = {}, usedL = {}, map = {}, ok = 0, c;
+  for(k = 0; k < K; k++) cnt.push({});
+  for(i = 0; i < labels.length; i++){
+    k = hard[i]; l = labels[i];
+    cnt[k][l] = (cnt[k][l] || 0) + 1;
+  }
+  pairs = [];
+  for(k = 0; k < K; k++) for(l in cnt[k]) pairs.push([cnt[k][l], k, +l]);
+  pairs.sort(function(a, b){ return b[0] - a[0]; });
+  for(i = 0; i < pairs.length; i++){
+    c = pairs[i];
+    if(usedK[c[1]] || usedL[c[2]]) continue;
+    usedK[c[1]] = 1; usedL[c[2]] = 1; map[c[1]] = c[2];
+  }
+  for(i = 0; i < labels.length; i++) if(map[hard[i]] === labels[i]) ok++;
+  return ok / labels.length;
+};
+
+/* ========================= ELBO ========================= */
+// closed form: E[ln p(X|Z,mu)] + E[ln p(Z|pi)] + E[ln p(pi)] + E[ln p(mu)]
+//            - E[ln q(Z)] - E[ln q(pi)] - E[ln q(mu)]
+VI.elbo = function(X, st){
+  var N = st.N, D = st.D, K = st.K, r = st.r, m = st.m, s2 = st.s2, alpha = st.alpha;
+  var sigmaSq = st.sigmaSq, sigma0sq = st.sigma0sq, alpha0 = st.alpha0, mu0 = st.mu0;
+  var ps = [], k, d, n, i, asum = 0;
+  for(k = 0; k < K; k++){ ps.push(VI.digamma(alpha[k])); asum += alpha[k]; }
+  var psum = VI.digamma(asum);
+  var Elogpi = new Array(K);
+  for(k = 0; k < K; k++) Elogpi[k] = ps[k] - psum;
+
+  // 1) E[ln p(X|Z,mu)]
+  var t1 = 0, ln2pisig = 0.5 * D * Math.log(2 * Math.PI * sigmaSq);
+  for(n = 0; n < N; n++){
+    for(k = 0; k < K; k++){
+      if(r[n][k] === 0) continue;
+      var q = 0;
+      for(d = 0; d < D; d++){ var df = X[n][d] - m[k][d]; q += df * df + s2[k][d]; }
+      t1 += r[n][k] * (-ln2pisig - q / (2 * sigmaSq));
+    }
+  }
+  // 2) E[ln p(Z|pi)]
+  var t2 = 0;
+  for(n = 0; n < N; n++){ var s = 0; for(k = 0; k < K; k++) s += r[n][k] * Elogpi[k]; t2 += s; }
+
+  // 3) E[ln p(pi)]  (Dirichlet)
+  var sumPsi = 0;
+  for(k = 0; k < K; k++) sumPsi += ps[k];
+  var t3 = VI.lgamma(K * alpha0) - K * VI.lgamma(alpha0) + (alpha0 - 1) * (sumPsi - K * psum);
+
+  // 4) E[ln p(mu)]
+  var t4 = 0, ln2pisig0 = 0.5 * Math.log(2 * Math.PI * sigma0sq);
+  for(k = 0; k < K; k++) for(d = 0; d < D; d++){
+    var dm = m[k][d] - mu0[d];
+    t4 += -ln2pisig0 - (dm * dm + s2[k][d]) / (2 * sigma0sq);
+  }
+
+  // 5) -E[ln q(Z)]  (categorical entropy)
+  var t5 = 0;
+  for(n = 0; n < N; n++) for(k = 0; k < K; k++){
+    var rk = r[n][k];
+    if(rk > 0) t5 -= rk * Math.log(rk);
+  }
+
+  // 6) -E[ln q(pi)]  (Dirichlet entropy)
+  var sumLg = 0;
+  for(k = 0; k < K; k++) sumLg += VI.lgamma(alpha[k]);
+  var t6 = -(VI.lgamma(asum) - sumLg);
+  t6 += (asum - K) * psum;
+  for(k = 0; k < K; k++) t6 -= (alpha[k] - 1) * ps[k];
+
+  // 7) -E[ln q(mu)]  (gaussian entropy, per dim)
+  var t7 = 0;
+  for(k = 0; k < K; k++) for(d = 0; d < D; d++) t7 += 0.5 * Math.log(2 * Math.PI * Math.E * s2[k][d]);
+
+  return t1 + t2 + t3 + t4 + t5 + t6 + t7;
+};
+
+/* ========================= CAVI ========================= */
+VI.defaults = function(){
+  return {
+    K: 3, sigmaSq: 0.49, sigma0sq: 25, alpha0: 0.5,
+    maxIter: 500, tol: 1e-12, seed: 42, mu0: null
+  };
+};
+
+VI.cavi = function(X, o){
+  o = o || {};
+  var def = VI.defaults();
+  var N = X.length, D = X[0].length, K = o.K || def.K;
+  var sigmaSq   = o.sigmaSq   == null ? def.sigmaSq   : o.sigmaSq;
+  var sigma0sq  = o.sigma0sq  == null ? def.sigma0sq  : o.sigma0sq;
+  var alpha0    = o.alpha0    == null ? def.alpha0    : o.alpha0;
+  var maxIter   = o.maxIter   == null ? def.maxIter   : o.maxIter;
+  var tol       = o.tol       == null ? def.tol       : o.tol;
+  var seed      = o.seed      == null ? def.seed      : o.seed;
+  var mu0 = o.mu0 || new Array(D);
+  var j;
+  for(j = 0; j < D; j++) if(mu0[j] == null) mu0[j] = 0;
+
+  var st = o.init || VI.init(X, K, seed, sigmaSq);
+  var r = st.r;
+  var m = [], s2 = [], alpha = new Array(K), k, d, n, it;
+  for(k = 0; k < K; k++){
+    m.push(new Array(D));
+    s2.push(new Array(D));
+    alpha[k] = alpha0;
+    for(d = 0; d < D; d++){ m[k][d] = 0; s2[k][d] = 1; }
+  }
+
+  var hist = [], prev = null, iters = 0, converged = false;
+  var state = { r: r, m: m, s2: s2, alpha: alpha, N: N, D: D, K: K,
+                sigmaSq: sigmaSq, sigma0sq: sigma0sq, alpha0: alpha0, mu0: mu0 };
+
+  for(it = 0; it < maxIter; it++){
+    // --- CAVI step 1: q(mu_kd) and q(pi) given q(Z) ---
+    var Nk = new Array(K), kk;
+    for(kk = 0; kk < K; kk++) Nk[kk] = 0;
+    for(n = 0; n < N; n++) for(k = 0; k < K; k++) Nk[k] += r[n][k];
+    for(k = 0; k < K; k++){
+      alpha[k] = alpha0 + Nk[k];
+      var prec0 = 1 / sigma0sq, lik = Nk[k] / sigmaSq;
+      for(d = 0; d < D; d++){
+        var sum = 0;
+        for(n = 0; n < N; n++) sum += r[n][k] * X[n][d];
+        var varK = 1 / (prec0 + lik);
+        s2[k][d] = varK;
+        m[k][d] = varK * (mu0[d] * prec0 + sum / sigmaSq);
+      }
+    }
+    // --- CAVI step 2: q(z_n) given q(mu), q(pi) ---
+    var Elogpi2 = new Array(K), asum2 = 0;
+    for(k = 0; k < K; k++) asum2 += alpha[k];
+    var psum2 = VI.digamma(asum2);
+    for(k = 0; k < K; k++) Elogpi2[k] = VI.digamma(alpha[k]) - psum2;
+    var ln2pisig = 0.5 * D * Math.log(2 * Math.PI * sigmaSq);
+    for(n = 0; n < N; n++){
+      var row = r[n], mx = -Infinity;
+      for(k = 0; k < K; k++){
+        var q = 0;
+        for(d = 0; d < D; d++){ var df = X[n][d] - m[k][d]; q += df * df + s2[k][d]; }
+        row[k] = Elogpi2[k] - ln2pisig - q / (2 * sigmaSq);
+        if(row[k] > mx) mx = row[k];
+      }
+      var ss = 0;
+      for(k = 0; k < K; k++){ row[k] = Math.exp(row[k] - mx); ss += row[k]; }
+      for(k = 0; k < K; k++) row[k] /= ss;
+    }
+    // --- ELBO after both coordinate updates (monotone non-decreasing) ---
+    var e = VI.elbo(X, state);
+    hist.push(e);
+    iters = it + 1;
+    if(prev !== null && Math.abs(e - prev) < tol){ converged = true; break; }
+    prev = e;
+  }
+  return { r: r, m: m, s2: s2, alpha: alpha, elboHist: hist, iters: iters,
+           converged: converged, N: N, D: D, K: K,
+           sigmaSq: sigmaSq, sigma0sq: sigma0sq, alpha0: alpha0, mu0: mu0 };
+};
+
+// multi-restart: ELBO is a proper objective, so pick the highest
+VI.caviBest = function(X, o){
+  o = o || {};
+  var R = o.restarts == null ? 6 : o.restarts;
+  var base = o.seed == null ? 42 : o.seed;
+  var best = null, runs = [], i;
+  for(i = 0; i < R; i++){
+    var oo = {};
+    for(var key in o) oo[key] = o[key];
+    oo.seed = base + i * 7919;
+    var s = VI.cavi(X, oo);
+    runs.push(s.elboHist[s.elboHist.length - 1]);
+    if(best === null || s.elboHist[s.elboHist.length - 1] > best.elboHist[best.elboHist.length - 1]) best = s;
+  }
+  best.runs = runs;
+  return best;
+};
+
+/* ============ exact log evidence (small N,K, brute force) ============ */
+// p(X) = sum_z [ DirMult(z) * prod_k I_k ],  I_k = marginal of assigned points
+// with mu_k integrated out under N(mu0, sigma0^2 I).
+VI.exactLogEvidence = function(X, o){
+  var N = X.length, D = X[0].length, K = o.K;
+  var sigmaSq = o.sigmaSq, sigma0sq = o.sigma0sq, alpha0 = o.alpha0;
+  var mu0 = o.mu0 || new Array(D), j;
+  for(j = 0; j < D; j++) if(mu0[j] == null) mu0[j] = 0;
+  var total = Math.pow(K, N), terms = [], mx = -Infinity, code, n, k, d, lp;
+  for(code = 0; code < total; code++){
+    var c = code, nk = new Array(K), assign = new Array(N);
+    for(k = 0; k < K; k++) nk[k] = 0;
+    for(n = 0; n < N; n++){ var a = c % K; c = (c - a) / K; assign[n] = a; nk[a]++; }
+    // Dirichlet-multinomial normaliser
+    lp = VI.lgamma(K * alpha0) - VI.lgamma(N + K * alpha0);
+    for(k = 0; k < K; k++) lp += VI.lgamma(nk[k] + alpha0) - VI.lgamma(alpha0);
+    // per-cluster marginal (Gaussian, mu integrated)
+    for(k = 0; k < K; k++){
+      var nn = nk[k];
+      if(nn === 0) continue;
+      var idx = [];
+      for(n = 0; n < N; n++) if(assign[n] === k) idx.push(n);
+      // det(sigma^2 I + sigma0^2 11^T) = sigma^{2nn}(1 + nn sigma0^2/sigma^2), per dim
+      lp += -0.5 * nn * D * Math.log(2 * Math.PI)
+          - 0.5 * (nn * D * Math.log(sigmaSq) + D * Math.log(1 + nn * sigma0sq / sigmaSq));
+      for(d = 0; d < D; d++){
+        var normA = 0, sumA = 0, i2;
+        for(i2 = 0; i2 < idx.length; i2++){
+          var v = X[idx[i2]][d] - mu0[d];
+          normA += v * v; sumA += v;
+        }
+        // alpha^T Sigma^{-1} alpha,  Sigma^{-1} = (1/s2)(I - s0s/(s2+nn*s0s) J)
+        var qf = (normA - (sigma0sq / (sigmaSq + nn * sigma0sq)) * sumA * sumA) / sigmaSq;
+        lp += -0.5 * qf;
+      }
+    }
+    terms.push(lp);
+    if(lp > mx) mx = lp;
+  }
+  var s = 0, i;
+  for(i = 0; i < terms.length; i++) s += Math.exp(terms[i] - mx);
+  return mx + Math.log(s);
+};
+
+/* ============ exact posterior for K=1 (analytic) ============ */
+VI.k1ExactPosterior = function(X, o){
+  var N = X.length, D = X[0].length, d, n;
+  var sigmaSq = o.sigmaSq, sigma0sq = o.sigma0sq;
+  var mu0 = o.mu0 || new Array(D);
+  var mean = new Array(D), variance = new Array(D);
+  for(d = 0; d < D; d++){
+    var m0 = mu0[d] == null ? 0 : mu0[d];
+    var prec = 1 / sigma0sq + N / sigmaSq, sum = 0;
+    for(n = 0; n < N; n++) sum += X[n][d];
+    variance[d] = 1 / prec;
+    mean[d] = variance[d] * (m0 / sigma0sq + sum / sigmaSq);
+  }
+  return { mean: mean, variance: variance };
+};
+
+/* ============ ML-EM comparator ============ */
+VI.em = function(X, o){
+  o = o || {};
+  var N = X.length, D = X[0].length, K = o.K || 3;
+  var sigmaSq = o.sigmaSq == null ? 0.49 : o.sigmaSq;
+  var maxIter = o.maxIter == null ? 300 : o.maxIter;
+  var seed = o.seed == null ? 42 : o.seed;
+  var rng = VI.mulberry32(seed);
+  var m = VI.kmeanspp(X, K, rng), n, k, d, it;
+  var lastR = null, hist = [], iters = 0;
+  for(it = 0; it < maxIter; it++){
+    var r = [], ll = 0;
+    for(n = 0; n < N; n++){
+      var row = new Array(K), mx = -Infinity;
+      for(k = 0; k < K; k++){
+        var q = 0;
+        for(d = 0; d < D; d++){ var df = X[n][d] - m[k][d]; q += df * df; }
+        row[k] = -0.5 * q / sigmaSq;
+        if(row[k] > mx) mx = row[k];
+      }
+      var s = 0;
+      for(k = 0; k < K; k++){ row[k] = Math.exp(row[k] - mx); s += row[k]; }
+      for(k = 0; k < K; k++) row[k] /= s;
+      ll += mx + Math.log(s);
+      r.push(row);
+    }
+    var nk = new Array(K);
+    for(k = 0; k < K; k++) nk[k] = 0;
+    for(n = 0; n < N; n++) for(k = 0; k < K; k++) nk[k] += r[n][k];
+    for(k = 0; k < K; k++){
+      if(nk[k] < 1e-12) continue;
+      for(d = 0; d < D; d++){
+        var sum = 0;
+        for(n = 0; n < N; n++) sum += r[n][k] * X[n][d];
+        m[k][d] = sum / nk[k];
+      }
+    }
+    hist.push(ll); lastR = r; iters = it + 1;
+    if(it > 0 && Math.abs(ll - hist[hist.length - 2]) < 1e-10) break;
+  }
+  return { m: m, r: lastR, llHist: hist, iters: iters };
+};
+
+globalThis.VI = VI;
+})();
+</script>
+
+<script id="ui">
+(function(){
+if(typeof document === "undefined") return;
+'use strict';
+
+var PAL = ["#5b5bd6", "#0ea472", "#e08a1e", "#dc3b3b", "#8b5cf6", "#0891b2"];
+var $ = function(id){ return document.getElementById(id); };
+var lastState = null;
+
+function el(tag, cls, txt){
+  var e = document.createElement(tag);
+  if(cls) e.className = cls;
+  if(txt != null) e.textContent = txt;
+  return e;
+}
+
+function statCard(k, v){
+  var d = el("div", "stat");
+  d.appendChild(el("div", "k", k));
+  d.appendChild(el("div", "v", v));
+  return d;
+}
+
+/* ---------- canvas helpers ---------- */
+function clear(ctx, w, h){
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h);
+}
+function frame(ctx, w, h, pad){
+  ctx.strokeStyle = "#e6e8f0"; ctx.lineWidth = 1;
+  ctx.strokeRect(pad.l, pad.t, w - pad.l - pad.r, h - pad.t - pad.b);
+}
+function grid(ctx, box, rows, cols){
+  var i;
+  ctx.strokeStyle = "#f0f1f7"; ctx.lineWidth = 1;
+  for(i = 1; i < rows; i++){
+    var y = box.t + (box.h * i) / rows;
+    ctx.beginPath(); ctx.moveTo(box.l, y); ctx.lineTo(box.l + box.w, y); ctx.stroke();
+  }
+  for(i = 1; i < cols; i++){
+    var x = box.l + (box.w * i) / cols;
+    ctx.beginPath(); ctx.moveTo(x, box.t); ctx.lineTo(x, box.t + box.h); ctx.stroke();
+  }
+}
+function label(ctx, txt, x, y, color, size){
+  ctx.fillStyle = color || "#6b7280";
+  ctx.font = (size || 11) + "px -apple-system,Segoe UI,PingFang SC,sans-serif";
+  ctx.fillText(txt, x, y);
+}
+
+/* ---------- ELBO curve ---------- */
+function drawElbo(hist){
+  var cv = $("cElbo"), W = cv.width, H = cv.height;
+  var ctx = cv.getContext("2d");
+  clear(ctx, W, H);
+  var pad = { l: 58, r: 16, t: 16, b: 30 };
+  var box = { l: pad.l, t: pad.t, w: W - pad.l - pad.r, h: H - pad.t - pad.b };
+  var mn = Infinity, mx = -Infinity, i;
+  for(i = 0; i < hist.length; i++){ if(hist[i] < mn) mn = hist[i]; if(hist[i] > mx) mx = hist[i]; }
+  if(!isFinite(mn)){ mn = 0; mx = 1; }
+  if(mx - mn < 1e-9) mx = mn + 1;
+  grid(ctx, box, 4, 5); frame(ctx, W, H, pad);
+  var X = function(i){ return box.l + (hist.length < 2 ? 0 : (i / (hist.length - 1)) * box.w); };
+  var Y = function(v){ return box.t + box.h - ((v - mn) / (mx - mn)) * box.h; };
+  // area
+  ctx.beginPath(); ctx.moveTo(X(0), box.t + box.h);
+  for(i = 0; i < hist.length; i++) ctx.lineTo(X(i), Y(hist[i]));
+  ctx.lineTo(X(hist.length - 1), box.t + box.h); ctx.closePath();
+  ctx.fillStyle = "rgba(91,91,214,.10)"; ctx.fill();
+  // line
+  ctx.beginPath();
+  for(i = 0; i < hist.length; i++){ if(i === 0) ctx.moveTo(X(i), Y(hist[i])); else ctx.lineTo(X(i), Y(hist[i])); }
+  ctx.strokeStyle = PAL[0]; ctx.lineWidth = 2; ctx.stroke();
+  label(ctx, mx.toFixed(1), 8, box.t + 8, "#6b7280");
+  label(ctx, mn.toFixed(1), 8, box.t + box.h, "#6b7280");
+  label(ctx, "iter 0", box.l, H - 10, "#9aa1b0");
+  label(ctx, "iter " + (hist.length - 1), box.l + box.w - 52, H - 10, "#9aa1b0");
+  label(ctx, "ELBO (变分下界)  单调不减", box.l + 6, box.t + 13, PAL[0], 11);
+}
+
+/* ---------- scatter ---------- */
+function drawScatter(X, state, hard, trueMeans){
+  var cv = $("cScatter"), W = cv.width, H = cv.height;
+  var ctx = cv.getContext("2d");
+  clear(ctx, W, H);
+  var pad = { l: 42, r: 18, t: 16, b: 30 };
+  var box = { l: pad.l, t: pad.t, w: W - pad.l - pad.r, h: H - pad.t - pad.b };
+  var D = X[0].length, i, d;
+  var lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
+  for(i = 0; i < X.length; i++) for(d = 0; d < 2 && d < D; d++){
+    if(X[i][d] < lo[d]) lo[d] = X[i][d];
+    if(X[i][d] > hi[d]) hi[d] = X[i][d];
+  }
+  for(d = 0; d < 2 && d < D; d++){
+    if(trueMeans) for(i = 0; i < trueMeans.length; i++){
+      if(trueMeans[i][d] < lo[d]) lo[d] = trueMeans[i][d];
+      if(trueMeans[i][d] > hi[d]) hi[d] = trueMeans[i][d];
+    }
+    var mg = (hi[d] - lo[d]) * 0.12 + 0.5;
+    lo[d] -= mg; hi[d] += mg;
+  }
+  var PX = function(v){ return box.l + ((v - lo[0]) / (hi[0] - lo[0])) * box.w; };
+  var PY = function(v){ return box.t + box.h - ((v - lo[1]) / (hi[1] - lo[1])) * box.h; };
+  grid(ctx, box, 6, 6); frame(ctx, W, H, pad);
+  for(d = 0; d < 2 && d < D; d++){
+    label(ctx, lo[d].toFixed(1), 6, d === 0 ? box.t + box.h : box.t + box.h, "#9aa1b0");
+    label(ctx, hi[d].toFixed(1), 6, d === 0 ? box.t + 8 : box.t + 8, "#9aa1b0");
+  }
+  // points
+  for(i = 0; i < X.length; i++){
+    ctx.beginPath();
+    ctx.arc(PX(X[i][0]), PY(X[i][1]), 2.6, 0, 2 * Math.PI);
+    ctx.fillStyle = PAL[hard[i] % PAL.length];
+    ctx.globalAlpha = 0.62; ctx.fill(); ctx.globalAlpha = 1;
+  }
+  // true centres (hollow)
+  if(trueMeans){
+    for(i = 0; i < trueMeans.length; i++){
+      ctx.beginPath();
+      ctx.arc(PX(trueMeans[i][0]), PY(trueMeans[i][1]), 6, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#9aa1b0"; ctx.lineWidth = 1.4; ctx.stroke();
+    }
+  }
+  // learned means +- std (box)
+  for(var k = 0; k < state.K; k++){
+    var sd = 0;
+    for(d = 0; d < D; d++) sd += Math.sqrt(state.s2[k][d]);
+    sd /= D;
+    ctx.strokeStyle = PAL[k % PAL.length]; ctx.lineWidth = 1.2;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(PX(state.m[k][0] - sd), PY(state.m[k][1] + sd), (2 * sd / (hi[0] - lo[0])) * box.w, (2 * sd / (hi[1] - lo[1])) * box.h);
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(PX(state.m[k][0]), PY(state.m[k][1]), 6.5, 0, 2 * Math.PI);
+    ctx.fillStyle = PAL[k % PAL.length]; ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    label(ctx, "μ" + k, PX(state.m[k][0]) + 9, PY(state.m[k][1]) - 7, PAL[k % PAL.length], 11);
+  }
+  label(ctx, "实心圆=数据（按 argmax r 着色）  ⊙=真中心  实心大点+虚线框=学习到的 q(μ) 均值±σ", box.l, H - 8, "#9aa1b0", 11);
+}
+
+/* ---------- responsibility heatmap ---------- */
+function drawHeat(state){
+  var cv = $("cHeat"), W = cv.width, H = cv.height;
+  var ctx = cv.getContext("2d");
+  clear(ctx, W, H);
+  var pad = { l: 44, r: 14, t: 14, b: 24 };
+  var box = { l: pad.l, t: pad.t, w: W - pad.l - pad.r, h: H - pad.t - pad.b };
+  var N = Math.min(state.N, 140), K = state.K, k, n;
+  var cw = box.w / N, ch = box.h / K;
+  for(k = 0; k < K; k++){
+    for(n = 0; n < N; n++){
+      var v = state.r[n][k];
+      ctx.fillStyle = "rgba(91,91,214," + v.toFixed(3) + ")";
+      ctx.fillRect(box.l + n * cw, box.t + k * ch, Math.max(cw, 1.1), ch);
+    }
+    label(ctx, "k=" + k, 8, box.t + k * ch + ch * 0.68, "#6b7280", 11);
+  }
+  frame(ctx, W, H, pad);
+  label(ctx, "列 = 数据点（前 " + N + " 个），行 = 分量；越深 = r_nk 越大", box.l, H - 7, "#9aa1b0", 11);
+}
+
+/* ---------- self checks ---------- */
+function checksFor(X, labels, state, seed, K, sigmaSq, sigma0sq, alpha0){
+  var out = [], i, k, d, n, e1, e2;
+
+  // 1) ELBO monotone
+  var minD = Infinity;
+  for(i = 1; i < state.elboHist.length; i++){
+    var dd = state.elboHist[i] - state.elboHist[i - 1];
+    if(dd < minD) minD = dd;
+  }
+  if(state.elboHist.length < 2) minD = 0;
+  out.push({ name: "ELBO 全历史单调不减", pass: minD > -1e-8, info: "min Δ = " + minD.toExponential(2) });
+
+  // 2) responsibility rows sum to 1
+  var maxDev = 0;
+  for(n = 0; n < X.length; n++){
+    var s = 0;
+    for(k = 0; k < K; k++) s += state.r[n][k];
+    maxDev = Math.max(maxDev, Math.abs(s - 1));
+  }
+  out.push({ name: "责任度行和 = 1", pass: maxDev < 1e-10, info: "max dev = " + maxDev.toExponential(2) });
+
+  // 3) E[pi] sums to 1 and all positive (alpha_k = alpha0 + sum_n r_nk > 0)
+  var asum = 0, epiSum = 0, allPos = true;
+  for(k = 0; k < K; k++){ asum += state.alpha[k]; if(state.alpha[k] <= 0) allPos = false; }
+  for(k = 0; k < K; k++) epiSum += state.alpha[k] / asum;
+  out.push({ name: "E[π] 之和 = 1 且 αₖ > 0",
+             pass: allPos && Math.abs(epiSum - 1) < 1e-12,
+             info: "Σα = " + asum.toFixed(3) + " · ΣE[π] = " + epiSum.toFixed(12) });
+
+  // 4) ELBO <= exact log evidence (brute force over all K^N = 2^6 assignments)
+  // 5) the mean-field symmetry-breaking gap is exactly ln 2 on a symmetric problem
+  var Xe = [[-2.2], [-1.8], [-2.0], [1.7], [2.1], [1.9]];
+  var eo = { K: 2, sigmaSq: 0.25, sigma0sq: 4, alpha0: 1.0 };
+  var evExact = VI.exactLogEvidence(Xe, eo);
+  var se = VI.caviBest(Xe, { K: 2, seed: 5, restarts: 8, sigmaSq: 0.25, sigma0sq: 4, alpha0: 1.0 });
+  var evElbo = se.elboHist[se.elboHist.length - 1];
+  var gap = evExact - evElbo;
+  out.push({ name: "ELBO ≤ 精确 log p(X)（穷举 2⁶ 分配）", pass: gap >= -1e-9,
+             info: "exact = " + evExact.toFixed(6) });
+  out.push({ name: "下界间隙 ≡ ln 2（均值场对称破缺代价）", pass: Math.abs(gap - Math.LN2) < 1e-6,
+             info: "gap = " + gap.toFixed(9) });
+
+  // 6) q(mu) precision >= prior precision
+  var ok5 = true;
+  for(k = 0; k < K; k++) for(d = 0; d < X[0].length; d++){
+    var prec = 1 / state.s2[k][d];
+    if(!isFinite(prec) || prec < 1 / sigma0sq - 1e-12) ok5 = false;
+  }
+  out.push({ name: "q(μ) 精度 ≥ 先验精度 1/σ₀²", pass: ok5, info: "全部通过" });
+
+  // 7) determinism
+  var o = { K: K, seed: seed, sigmaSq: sigmaSq, sigma0sq: sigma0sq, alpha0: alpha0, restarts: 2 };
+  var A = VI.caviBest(X, o), B = VI.caviBest(X, o);
+  var same = A.elboHist.length === B.elboHist.length;
+  for(i = 0; same && i < A.elboHist.length; i++) if(A.elboHist[i] !== B.elboHist[i]) same = false;
+  out.push({ name: "确定性（两次运行逐位一致）", pass: same, info: "iters " + A.elboHist.length });
+
+  // 8) K=1 ELBO == exact evidence
+  var Xs = [];
+  for(i = 0; i < 12; i++) Xs.push([1.4 * Math.sin(i * 1.7) + 0.3 * i]);
+  var s1 = VI.cavi(Xs, { K: 1, seed: 7, sigmaSq: sigmaSq, sigma0sq: sigma0sq, alpha0: alpha0, maxIter: 200 });
+  var eEx1 = VI.exactLogEvidence(Xs, { K: 1, sigmaSq: sigmaSq, sigma0sq: sigma0sq, alpha0: alpha0 });
+  e1 = s1.elboHist[s1.elboHist.length - 1]; e2 = eEx1;
+  out.push({ name: "K=1：ELBO ≡ 精确 log 证据", pass: Math.abs(e1 - e2) < 1e-9, info: "Δ = " + Math.abs(e1 - e2).toExponential(2) });
+
+  // 9) no NaN/Inf
+  var finite = true;
+  for(k = 0; k < K; k++){
+    for(d = 0; d < X[0].length; d++) if(!isFinite(state.m[k][d]) || !isFinite(state.s2[k][d])) finite = false;
+    if(!isFinite(state.alpha[k])) finite = false;
+  }
+  for(i = 0; i < state.elboHist.length; i++) if(!isFinite(state.elboHist[i])) finite = false;
+  out.push({ name: "无 NaN / Inf", pass: finite, info: "全部有限" });
+
+  return out;
+}
+
+/* ---------- main ---------- */
+function run(){
+  var seed = parseInt($("seed").value, 10) || 42;
+  var K = Math.max(1, Math.min(6, parseInt($("K").value, 10) || 3));
+  var N = Math.max(30, Math.min(1200, parseInt($("N").value, 10) || 210));
+  var restarts = Math.max(1, Math.min(20, parseInt($("restarts").value, 10) || 6));
+  $("run").disabled = true;
+  $("status").textContent = "推断中…";
+
+  var means = [], i, k;
+  var mode = $("mode") ? ($("mode").value || "sep") : "sep";
+  try {
+    var rng = VI.mulberry32(1234);
+    var base, sig;
+    if(mode === "ovl"){
+      sig = 1.30;
+      base = [[-1.8, -1.8], [1.8, -1.8], [0.0, 2.0], [2.0, 1.8], [-2.0, 1.8], [0.0, 0.0]];
+    } else {
+      sig = 0.70;
+      base = [[-3.1, -3.0], [3.0, -3.2], [0.0, 3.3], [3.4, 3.2], [-3.3, 3.1], [0.0, 0.0]];
+    }
+    for(k = 0; k < K; k++) means.push(base[k % base.length].slice());
+    var per = Math.max(5, Math.floor(N / K));
+    var data = VI.makeData(rng, means, per, sig);
+    var X = data.X, labels = data.labels;
+
+    var o = { K: K, seed: seed, restarts: restarts };
+    var t0 = (new Date()).getTime();
+    var st = VI.caviBest(X, o);
+    var ms = (new Date()).getTime() - t0;
+
+    var em = VI.em(X, o);
+    var hard = VI.hardAssign(st.r);
+    var acc = VI.clusterAcc(labels, hard, K);
+    var emAcc = VI.clusterAcc(labels, VI.hardAssign(em.r), K);
+
+    // em means are exact centres only if cluster occupied; guard
+    if(!isFinite(emAcc)) emAcc = 0;
+
+    var Elogpi = [], asum = 0;
+    for(k = 0; k < K; k++) asum += st.alpha[k];
+    for(k = 0; k < K; k++) Elogpi.push(st.alpha[k] / asum);
+    var epi = Elogpi.map(function(v){ return v.toFixed(3); }).join(" / ");
+
+    var statsBox = $("stats");
+    statsBox.innerHTML = "";
+    statsBox.appendChild(statCard("最终 ELBO", st.elboHist[st.elboHist.length - 1].toFixed(3)));
+    statsBox.appendChild(statCard("CAVI 迭代 / 重启", st.iters + " / " + restarts));
+    statsBox.appendChild(statCard("簇恢复准确率", (acc * 100).toFixed(1) + "%"));
+    statsBox.appendChild(statCard("EM 对照准确率", (emAcc * 100).toFixed(1) + "%"));
+    var extra = el("div", "stat");
+    extra.style.gridColumn = "1 / -1";
+    extra.appendChild(el("div", "k", "变分后验簇权重 E[π] = αₖ/Σα · " + (mode === "ovl" ? "重叠 σ=1.30" : "分离 σ=0.70") +
+      " · 耗时 " + ms + " ms · N=" + X.length + " D=" + X[0].length));
+    extra.appendChild(el("div", "v", epi));
+    statsBox.appendChild(extra);
+
+    drawElbo(st.elboHist);
+    drawScatter(X, st, hard, means);
+    drawHeat(st);
+
+    var cs = checksFor(X, labels, st, seed, K, 0.49, 25, 0.5);
+    var ul = $("checks");
+    ul.innerHTML = "";
+    for(i = 0; i < cs.length; i++){
+      var li = el("li");
+      li.appendChild(el("span", "mk " + (cs[i].pass ? "ok" : "no"), cs[i].pass ? "✓" : "✗"));
+      var sp = el("span", null, cs[i].name);
+      sp.style.flex = "1";
+      li.appendChild(sp);
+      li.appendChild(el("span", null, cs[i].info));
+      ul.appendChild(li);
+    }
+    var all = cs.every(function(c){ return c.pass; });
+    lastState = st;
+    if(typeof globalThis !== "undefined") globalThis.__VILAST = st;
+    if(typeof globalThis !== "undefined") globalThis.__VICHECKS = cs;
+    $("status").textContent = all ? ("自检 " + cs.length + "/" + cs.length + " 全绿 ✓") : "存在未通过项 ✗";
+    $("status").className = "note " + (all ? "ok" : "no");
+  } catch(err){
+    $("status").textContent = "错误：" + (err && err.message ? err.message : err);
+    $("status").className = "note no";
+  }
+  $("run").disabled = false;
+}
+
+$("run").addEventListener("click", run);
+if(typeof globalThis !== "undefined") globalThis.__VIRUN = run;
+})();
+</script>
+</body>
+</html>
