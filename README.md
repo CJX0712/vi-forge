@@ -1,5 +1,12 @@
 # vi-forge · 手写变分推断（Mean-Field CAVI）
 
+<p align="center">
+  <a href="https://github.com/CJX0712/vi-forge/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/vi-forge/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/vi-forge/releases"><img src="https://img.shields.io/github/v/release/CJX0712/vi-forge?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/vi-forge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/vi-forge" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 > 用纯 JavaScript 从零实现**坐标上升变分推断**（Coordinate Ascent Variational Inference, CAVI），
 > 在贝叶斯高斯混合模型上做均值场（mean-field）后验近似。
 > 单文件 HTML、零依赖、零构建，浏览器内一键自检 + 无头 Node **18/18 不变量全绿**。
